@@ -1,0 +1,256 @@
+
+/* =========================================
+   RACC - PROFESSIONAL DASHBOARD DESIGN
+   Design only. No changes to analysis logic.
+   ========================================= */
+
+:root {
+    --navy: #17365d;
+    --blue: #2878d0;
+    --light-blue: #eaf3ff;
+    --background: #f4f7fb;
+    --white: #ffffff;
+    --text: #243247;
+    --muted: #718096;
+    --border: #e1e8f0;
+}
+
+/* Main background */
+
+.stApp {
+    background-color: var(--background);
+    color: var(--text);
+}
+
+.block-container {
+    max-width: 1500px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+
+/* Headings */
+
+h1 {
+    color: var(--navy) !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.8px;
+}
+
+h2, h3 {
+    color: var(--navy) !important;
+    font-weight: 700 !important;
+}
+
+/* Main title styling */
+
+[data-testid="stAppViewBlockContainer"] h1 {
+    padding-bottom: 5px;
+}
+
+/* Sidebar */
+
+[data-testid="stSidebar"] {
+    background: linear-gradient(
+        180deg,
+        #17365d 0%,
+        #214d7a 100%
+    );
+    border-right: 1px solid #d5dfec;
+}
+
+[data-testid="stSidebar"] * {
+    color: #ffffff;
+}
+
+[data-testid="stSidebar"] hr {
+    border-color: rgba(255, 255, 255, 0.22);
+}
+
+/* Sidebar widgets */
+
+[data-testid="stSidebar"] input,
+[data-testid="stSidebar"] textarea {
+    background: #ffffff !important;
+    color: #243247 !important;
+}
+
+[data-testid="stSidebar"] [data-baseweb="select"] > div {
+    background: #ffffff;
+    color: #243247;
+}
+
+[data-testid="stSidebar"] [data-baseweb="select"] * {
+    color: #243247;
+}
+
+/* Sidebar uploader */
+
+[data-testid="stSidebar"] [data-testid="stFileUploader"] {
+    padding: 12px;
+    border: 1px dashed rgba(255, 255, 255, 0.5);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* Radio navigation */
+
+[data-testid="stSidebar"] [role="radiogroup"] {
+    gap: 8px;
+}
+
+[data-testid="stSidebar"] [role="radiogroup"] label {
+    padding: 9px 10px;
+    border-radius: 8px;
+    transition: background 0.2s ease;
+}
+
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+/* Metric cards */
+
+[data-testid="stMetric"] {
+    background: var(--white);
+    padding: 20px 22px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 4px 14px rgba(23, 54, 93, 0.055);
+    transition: transform 0.2s ease,
+                box-shadow 0.2s ease;
+}
+
+[data-testid="stMetric"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 20px rgba(23, 54, 93, 0.10);
+}
+
+[data-testid="stMetricLabel"] {
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+[data-testid="stMetricValue"] {
+    color: var(--navy);
+    font-weight: 800;
+}
+
+/* Buttons */
+
+.stButton > button,
+.stDownloadButton > button,
+[data-testid="stFormSubmitButton"] > button {
+    min-height: 42px;
+    border-radius: 9px;
+    background: var(--blue);
+    color: white;
+    border: 1px solid var(--blue);
+    font-weight: 650;
+    transition: all 0.2s ease;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover,
+[data-testid="stFormSubmitButton"] > button:hover {
+    background: var(--navy);
+    color: white;
+    border-color: var(--navy);
+}
+
+/* Data tables */
+
+[data-testid="stDataFrame"] {
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* Charts */
+
+[data-testid="stVegaLiteChart"],
+[data-testid="stArrowVegaLiteChart"],
+[data-testid="stPlotlyChart"],
+[data-testid="stLineChart"],
+[data-testid="stBarChart"] {
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+}
+
+/* Expandable sections */
+
+[data-testid="stExpander"] {
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+}
+
+[data-testid="stExpander"] summary {
+    font-weight: 600;
+}
+
+/* Forms */
+
+[data-testid="stForm"] {
+    padding: 20px;
+    background: var(--white);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+}
+
+/* Input fields */
+
+[data-testid="stTextInput"] input,
+[data-testid="stDateInput"] input,
+[data-testid="stTimeInput"] input {
+    border-radius: 8px;
+}
+
+/* File uploader in main content */
+
+[data-testid="stFileUploader"] {
+    border-radius: 12px;
+}
+
+/* Information and alert boxes */
+
+[data-testid="stAlert"] {
+    border-radius: 10px;
+}
+
+/* Section separators */
+
+hr {
+    border-color: var(--border);
+}
+
+/* Captions */
+
+[data-testid="stCaptionContainer"] {
+    color: var(--muted);
+}
+
+/* Footer spacing */
+
+[data-testid="stMainBlockContainer"] {
+    padding-bottom: 30px;
+}
+
+/* Responsive design */
+
+@media (max-width: 768px) {
+    .block-container {
+        padding: 1rem;
+    }
+
+    [data-testid="stMetric"] {
+        padding: 14px;
+    }
+
+    [data-testid="stMetricValue"] {
+        font-size: 23px;
+    }
+}
