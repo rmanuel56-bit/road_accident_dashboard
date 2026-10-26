@@ -73,7 +73,22 @@ def prediction_form(bundle):
         st.caption('Illustrative prediction among reported records. Review the performance table before use.')
 
 def main():
-    st.set_page_config(page_title='RACC analysis', layout='wide')
+   def main():
+    st.set_page_config(
+        page_title='RACC | Road Accident Analysis',
+        page_icon='🚦',
+        layout='wide'
+    )
+
+    from pathlib import Path
+
+    css_path = Path(__file__).parent / "style.css"
+
+    if css_path.exists():
+        st.markdown(
+            f"<style>{css_path.read_text(encoding='utf-8')}</style>",
+            unsafe_allow_html=True
+        )
     st.title('RACC data analysis')
     st.caption('Upload your CSV and run the analysis you need. All results stay in this browser session.')
     upload = st.sidebar.file_uploader('Upload CSV dataset', type=['csv'], key='dataset_upload')
