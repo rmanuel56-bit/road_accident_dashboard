@@ -1,286 +1,212 @@
-from pathlib import Path
-import io, zipfile
+"""Run: python -m streamlit run racc_streamlit_app.py
+Keep the three part_*.py files in the same folder. Install requirements.txt first.
+"""
+from io import BytesIO
+from datetime import date, time
+import hashlib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.tree import DecisionTreeClassifier, plot_tree, export_text
-from sklearn.dummy import DummyClassifier
-from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
-                             classification_report, confusion_matrix, silhouette_score)
-from sklearn.cluster import KMeans
-
-st.set_page_config(page_title='RACC Decision Tree Dashboard', layout='wide')
-REQUIRED = ['DATE','TIME','LOCATION','WEATHER','ROAD CONDITION','VEHICLE TYPE','CAUSE','SEVERITY','GENDER']
-BARANGAYS = ['Bunawan Brook','Consuelo','Imelda','Libertad','Mambalili','Nueva Era','Poblacion','San Andres','San Marcos','San Teodoro']
-
-@st.cache_data(show_spinner=False)
-def load_data(raw_bytes, encoding='utf-8-sig', sep=','):
-    df = pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, sep=sep)
-    # Trim headers and cell whitespace without silently deleting rows.
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    missing_cols = [c for c in REQUIRED if c not in df.columns]
-    if missing_cols:
-        raise ValueError('Missing required columns: ' + ', '.join(missing_cols))
-    raw = df[REQUIRED].copy()
-    raw['source_row'] = np.arange(2, len(raw)+2)
-    d = raw.copy()
-    d['date'] = pd.to_datetime(d['DATE'].astype('string').str.strip(), dayfirst=True, errors='coerce')
-    d['hour'] = d['TIME'].map(parse_hour)
-    for c in ['LOCATION','WEATHER','ROAD CONDITION','VEHICLE TYPE','CAUSE','SEVERITY','GENDER']:
-        d[c] = d[c].astype('string').str.strip().replace('', pd.NA)
-    d['severity_norm'] = d['SEVERITY'].str.lower().str.strip()
-    d['severity_norm'] = d['severity_norm'].replace({
-        'major injury':'major injury', 'minor injry':'minor injury', 'minor injury':'minor injury',
-        'no injury':'no injury', 'fatal':'fatal', 'conscious':'conscious', 'unconscious':'unconscious'
-    })
-    d['injury_grade'] = d['severity_norm'].map({
-        'minor injury':'minor injury','no injury':'no injury','major injury':'major injury','fatal':'fatal'
-    })
-    d['severe'] = d['injury_grade'].map({'minor injury':0,'no injury':0,'major injury':1,'fatal':1}).astype('Int64')
-    d['year'] = d['date'].dt.year
-    d['month'] = d['date'].dt.month
-    d['weekday'] = d['date'].dt.dayofweek
-    d['month_sin'] = np.sin(2*np.pi*d['month']/12)
-    d['month_cos'] = np.cos(2*np.pi*d['month']/12)
-    d['hour_sin'] = np.sin(2*np.pi*d['hour']/24)
-    d['hour_cos'] = np.cos(2*np.pi*d['hour']/24)
-    d['area'] = d['LOCATION'].map(normalize_location)
-    d['weather'] = d['WEATHER'].str.lower().str.strip().replace({'sunny':'clear','light rain':'rainy'})
-    d['road_condition'] = d['ROAD CONDITION'].str.lower().str.strip().replace({'wet':'wet','clear':'dry'})
-    d['vehicle'] = d['VEHICLE TYPE'].str.lower().str.strip().replace({
-        'motorcyle':'motorcycle','motor cycle':'motorcycle','motor single':'single motor'
-    })
-    d['cause'] = d['CAUSE'].str.lower().str.strip()
-    d['gender_group'] = d['GENDER'].str.lower().str.strip()
-    audit = pd.DataFrame({
-        'check':['Original records','Exact duplicate rows (review before removal)','Missing date','Unusable time','Missing location','Missing weather','Missing road condition','Missing vehicle type','Missing cause','Missing severity','Missing gender','Usable injury-grade labels','Unclassified severity labels'],
-        'count':[len(d),int(raw[REQUIRED].duplicated().sum()),int(d.date.isna().sum()),int(d.hour.isna().sum()),int(d.LOCATION.isna().sum()),int(d.WEATHER.isna().sum()),int(d['ROAD CONDITION'].isna().sum()),int(d['VEHICLE TYPE'].isna().sum()),int(d.CAUSE.isna().sum()),int(d.SEVERITY.isna().sum()),int(d.GENDER.isna().sum()),int(d.injury_grade.notna().sum()),int(d.injury_grade.isna().sum())]
-    })
-    return d, audit, raw
-
-def parse_hour(value):
-    if pd.isna(value): return np.nan
-    s=str(value).strip()
-    if not s: return np.nan
-    t=pd.to_datetime(s, errors='coerce')
-    if pd.notna(t): return float(t.hour + t.minute/60)
-    # Also accept 24-hour strings such as 18:30 or numeric hour values.
-    try:
-        n=float(s)
-        if 0 <= n <= 23: return n
-    except Exception: pass
-    return np.nan
-
-def normalize_location(value):
-    if pd.isna(value): return 'Unknown'
-    s=' '.join(str(value).lower().replace('-', ' ').replace(',', ' ').split())
-    for b in BARANGAYS:
-        key=b.lower()
-        if key in s:
-            return b
-    # Retain the original normalized location if no known barangay matched.
-    return ' '.join(w.capitalize() for w in s.split())
-
-def make_classifier(max_depth=5, min_leaf=8):
-    cat=['weather','road_condition','vehicle','cause','area','gender_group']
-    num=['hour_sin','hour_cos','month_sin','month_cos','weekday']
-    pre=ColumnTransformer([
-        ('cat',Pipeline([('impute',SimpleImputer(strategy='most_frequent')),('onehot',OneHotEncoder(handle_unknown='ignore'))]),cat),
-        ('num',Pipeline([('impute',SimpleImputer(strategy='median')),('scale',StandardScaler())]),num)
-    ])
-    tree=DecisionTreeClassifier(max_depth=max_depth,min_samples_leaf=min_leaf,class_weight='balanced',random_state=42)
-    return Pipeline([('preprocess',pre),('tree',tree)])
-
-def get_features(d):
-    return d[['weather','road_condition','vehicle','cause','area','gender_group','hour_sin','hour_cos','month_sin','month_cos','weekday']].copy()
-
-def chronological_split(frame):
-    valid=frame.loc[frame.date.notna()].sort_values('date').copy()
-    if valid.empty: raise ValueError('No valid dates are available for a chronological split.')
-    last_year=valid.date.dt.year.max()
-    train=valid.loc[valid.date.dt.year < last_year]
-    test=valid.loc[valid.date.dt.year == last_year]
-    if len(train)<40 or len(test)<15 or train.severe.nunique()<2 or test.severe.nunique()<2:
-        cut=valid.date.quantile(.8)
-        train=valid.loc[valid.date < cut]
-        test=valid.loc[valid.date >= cut]
-    train=train.loc[train.severe.notna()]
-    test=test.loc[test.severe.notna()]
-    if len(train)<30 or len(test)<10 or train.severe.nunique()<2:
-        raise ValueError('Not enough dated, valid injury-grade records in both classes for a reliable holdout evaluation.')
-    return train,test
-
-def run_decision_tree(d, max_depth, min_leaf):
-    eligible=d.loc[d.severe.notna() & d.date.notna()].copy()
-    train,test=chronological_split(eligible)
-    model=make_classifier(max_depth,min_leaf)
-    Xtr=get_features(train); Xte=get_features(test); ytr=train.severe.astype(int); yte=test.severe.astype(int)
-    model.fit(Xtr,ytr)
-    pred=model.predict(Xte)
-    proba=model.predict_proba(Xte)[:,list(model.named_steps['tree'].classes_).index(1)]
-    base=DummyClassifier(strategy='prior').fit(np.zeros((len(ytr),1)),ytr)
-    base_pred=base.predict(np.zeros((len(yte),1)))
-    rows=[]
-    for name,yp in [('Decision Tree',pred),('Majority-class baseline',base_pred)]:
-        rows.append({'Model':name,'Accuracy':accuracy_score(yte,yp),'Precision (severe)':precision_score(yte,yp,zero_division=0),
-                     'Recall (severe)':recall_score(yte,yp,zero_division=0),'F1-score (severe)':f1_score(yte,yp,zero_division=0),
-                     'Macro F1':f1_score(yte,yp,average='macro',zero_division=0),'Test records':len(yte)})
-    actual_pred=test[['source_row','date','LOCATION','WEATHER','ROAD CONDITION','VEHICLE TYPE','CAUSE','SEVERITY','injury_grade']].copy()
-    actual_pred['actual_class']=yte.map({0:'Non-severe',1:'Severe'}).to_numpy()
-    actual_pred['predicted_class']=pd.Series(pred,index=test.index).map({0:'Non-severe',1:'Severe'}).to_numpy()
-    actual_pred['probability_severe']=proba
-    actual_pred['correct_prediction']=actual_pred['actual_class'].eq(actual_pred['predicted_class'])
-    cm=confusion_matrix(yte,pred,labels=[0,1])
-    names=model.named_steps['preprocess'].get_feature_names_out()
-    rules=export_text(model.named_steps['tree'],feature_names=list(names),decimals=3)
-    importance=pd.DataFrame({'Feature':names,'Importance':model.named_steps['tree'].feature_importances_}).sort_values('Importance',ascending=False)
-    report=pd.DataFrame(classification_report(yte,pred,labels=[0,1],target_names=['Non-severe','Severe'],output_dict=True,zero_division=0)).T.reset_index(names='Class')
-    return {'model':model,'metrics':pd.DataFrame(rows),'actual_pred':actual_pred,'cm':cm,'rules':rules,'importance':importance,'report':report,'train':train,'test':test,'n_eligible':len(eligible)}
-
-def run_kmeans(d, kmax=6):
-    f=d.loc[d.date.notna()].copy()
-    if len(f)<5: raise ValueError('At least five dated records are required for clustering.')
-    cats=f[['weather','road_condition','vehicle','cause','area','gender_group']].fillna('Unknown')
-    enc=OneHotEncoder(handle_unknown='ignore')
-    mat=enc.fit_transform(cats)
-    if mat.shape[0]>500:
-        rng=np.random.RandomState(42); ix=np.sort(rng.choice(mat.shape[0],500,replace=False)); sample=mat[ix]
-    else: sample=mat
-    rows=[]
-    for k in range(2,min(kmax, sample.shape[0]-1)+1):
-        try:
-            km=KMeans(n_clusters=k,random_state=42,n_init=10).fit(sample)
-            score=silhouette_score(sample,km.labels_)
-            rows.append({'k':k,'Silhouette score':score})
-        except Exception: pass
-    if not rows: raise ValueError('Could not calculate a silhouette score for this data.')
-    best=max(rows,key=lambda x:x['Silhouette score'])['k']
-    final=KMeans(n_clusters=best,random_state=42,n_init=10).fit(mat)
-    f['Cluster']=final.labels_.astype(str)
-    profiles=f.groupby('Cluster').agg(Records=('Cluster','size'),Most_common_weather=('weather',lambda x:x.mode().iat[0] if not x.mode().empty else 'Unknown'),Most_common_road=('road_condition',lambda x:x.mode().iat[0] if not x.mode().empty else 'Unknown'),Most_common_vehicle=('vehicle',lambda x:x.mode().iat[0] if not x.mode().empty else 'Unknown'),Most_common_cause=('cause',lambda x:x.mode().iat[0] if not x.mode().empty else 'Unknown'),Most_common_location=('area',lambda x:x.mode().iat[0] if not x.mode().empty else 'Unknown')).reset_index()
-    return pd.DataFrame(rows),profiles,f
-
-# Sidebar and upload
-st.title('Road Accident Data Analysis Dashboard')
-st.caption('Bunawan, Agusan del Sur | Decision Tree classification, K-Means clustering, and reported-accident concentration')
-with st.sidebar:
-    st.header('Dataset')
-    uploaded=st.file_uploader('Upload RACC.csv',type=['csv'])
-    st.caption('If no file is uploaded, the bundled RACC.csv is used.')
-    max_depth=st.slider('Decision Tree maximum depth',2,8,5)
-    min_leaf=st.slider('Minimum records per leaf',2,25,8)
-    st.caption('Tree settings are chosen before evaluating the held-out data. Compare alternatives carefully to avoid tuning to the test set.')
-
-if uploaded is not None:
-    raw_bytes=uploaded.getvalue()
-else:
-    default_path=Path(__file__).with_name('RACC.csv')
-    raw_bytes=default_path.read_bytes() if default_path.exists() else None
-if raw_bytes is None:
-    st.info('Upload the RACC.csv dataset to begin.'); st.stop()
 try:
-    d,audit,raw=load_data(raw_bytes)
-except Exception as exc:
-    st.error(str(exc)); st.stop()
+    from part_2_data import REQUIRED, prepare_data, make_counts, statistical_analysis, features
+    from part_3_models import classification_analysis, prediction_analysis
+    from part_4_results import forecasting_analysis, download_package
+    from part_5_clustering import clustering_analysis, hotspot_analysis
+except ModuleNotFoundError as exc:
+    st.error('Missing file or Python package: ' + str(exc.name))
+    st.info('Extract the complete ZIP into one folder, then install requirements.txt. Run the main file only.')
+    st.stop()
 
-# Overview
-valid_sev=int(d.injury_grade.notna().sum())
-col1,col2,col3,col4=st.columns(4)
-col1.metric('Uploaded records',f'{len(d):,}')
-col2.metric('Valid injury grades',f'{valid_sev:,}')
-col3.metric('Records with valid dates',f'{int(d.date.notna().sum()):,}')
-col4.metric('Exact duplicate rows to review',f'{int(raw[REQUIRED].duplicated().sum()):,}')
-st.info('The model predicts severe vs. non-severe injury among records with recognized injury grades. “Conscious” and “Unconscious” are not automatically converted into injury grades. Exact duplicates are flagged for review, not automatically deleted.')
+def show_table(title, frame, key):
+    st.subheader(title)
+    if frame.empty:
+        st.info('No rows meet the requirements for this table.'); return
+    st.dataframe(frame, width='stretch')
+    st.download_button('Download CSV', frame.to_csv(index=False).encode('utf-8'),
+                       file_name=key + '.csv', mime='text/csv', key='download_' + key)
 
-page=st.sidebar.radio('Pages',['Overview & cleaning','Decision Tree classification','K-Means clustering','Accident concentration','Data dictionary'])
-if page=='Overview & cleaning':
-    st.header('Data quality review')
-    st.dataframe(audit,use_container_width=True,hide_index=True)
-    st.subheader('Raw severity labels')
-    st.bar_chart(d['SEVERITY'].fillna('Missing').astype(str).value_counts())
-    st.subheader('Normalized location counts')
-    st.bar_chart(d['area'].value_counts().head(15))
-    st.subheader('Cleaned records')
-    st.dataframe(d.drop(columns=['month_sin','month_cos','hour_sin','hour_cos']),use_container_width=True)
-    st.download_button('Download cleaned dataset',d.to_csv(index=False).encode('utf-8'),file_name='RACC_cleaned.csv',mime='text/csv')
-    st.download_button('Download data quality report',audit.to_csv(index=False).encode('utf-8'),file_name='RACC_data_quality_report.csv',mime='text/csv')
-elif page=='Decision Tree classification':
-    st.header('Decision Tree: severe versus non-severe injury')
-    st.write('Severe = Major Injury or Fatal. Non-severe = Minor Injury or No Injury. Unrecognized severity labels are excluded from supervised training and evaluation, not imputed.')
+def run_analysis(bundle, key, function, *args):
     try:
-        with st.spinner('Training and evaluating the Decision Tree on a chronological holdout…'):
-            r=run_decision_tree(d,max_depth,min_leaf)
-        m1,m2,m3,m4=st.columns(4)
-        row=r['metrics'].iloc[0]
-        m1.metric('Accuracy',f"{row['Accuracy']:.1%}")
-        m2.metric('Precision (severe)',f"{row['Precision (severe)']:.1%}")
-        m3.metric('Recall (severe)',f"{row['Recall (severe)']:.1%}")
-        m4.metric('F1-score (severe)',f"{row['F1-score (severe)']:.1%}")
-        st.caption(f"Training records: {len(r['train']):,} | Held-out records: {len(r['test']):,} | Eligible dated records: {r['n_eligible']:,}. Holdout dates: {r['test'].date.min().date()} to {r['test'].date.max().date()}.")
-        st.subheader('Model performance')
-        st.dataframe(r['metrics'].style.format({c:'{:.3f}' for c in ['Accuracy','Precision (severe)','Recall (severe)','F1-score (severe)','Macro F1']}),use_container_width=True,hide_index=True)
-        st.subheader('Confusion matrix')
-        cm=pd.DataFrame(r['cm'],index=['Actual non-severe','Actual severe'],columns=['Predicted non-severe','Predicted severe'])
-        st.dataframe(cm,use_container_width=True)
-        st.subheader('Decision Tree visualization')
-        tree=r['model'].named_steps['tree']; feature_names=r['model'].named_steps['preprocess'].get_feature_names_out()
-        fig,ax=plt.subplots(figsize=(22,10))
-        plot_tree(tree,feature_names=feature_names,class_names=['Non-severe','Severe'],filled=False,rounded=True,fontsize=7,max_depth=3,ax=ax)
-        ax.set_title('Top levels of the evaluated Decision Tree (display limited to depth 3)')
-        st.pyplot(fig); plt.close(fig)
-        st.caption('Visualization is limited to the first three levels for readability. Metrics are from the full evaluated tree.')
-        st.subheader('Learned decision rules')
-        st.code(r['rules'],language='text')
-        st.subheader('Actual versus predicted holdout records')
-        st.dataframe(r['actual_pred'],use_container_width=True,hide_index=True)
-        st.download_button('Download actual vs predicted CSV',r['actual_pred'].to_csv(index=False).encode('utf-8'),file_name='decision_tree_actual_vs_predicted.csv',mime='text/csv')
-        st.download_button('Download classification metrics CSV',r['metrics'].to_csv(index=False).encode('utf-8'),file_name='decision_tree_metrics.csv',mime='text/csv')
-        st.subheader('Feature importance')
-        st.bar_chart(r['importance'].head(15).set_index('Feature')['Importance'])
-        st.dataframe(r['importance'],use_container_width=True,hide_index=True)
-        st.caption('Feature importance describes splits used by this fitted tree; it does not prove causation. Results depend on label quality and reporting patterns.')
+        with st.spinner('Running ' + key + '…'):
+            bundle['results'][key] = function(*args)
+        st.success('Analysis completed.')
     except Exception as exc:
-        st.error('Could not evaluate Decision Tree: '+str(exc))
-elif page=='K-Means clustering':
-    st.header('K-Means accident pattern clustering')
-    st.caption('Clustering groups similar records based on categorical context. It does not predict future accidents or establish causes.')
-    if st.button('Run K-Means analysis'):
+        st.error(key.capitalize() + ': ' + str(exc))
+        with st.expander('Error details'): st.exception(exc)
+
+def show_classification(result):
+    st.write('Selected using development data:', result['selected_name'])
+    show_table('Classification performance (including Decision Tree)', result['metrics'], 'classification_metrics')
+    show_table('Decision Tree precision, recall and F1 by class', result['decision_tree_report'], 'decision_tree_report')
+    if result['metrics'].iloc[0].ROC_AUC < .55:
+        st.warning('Held-out discrimination is close to chance. Feature rankings are exploratory, not validated risk factors.')
+    for title, key in [('Development comparison', 'cv'), ('Train/test dates', 'split'),
+                       ('Class-level results', 'report'), ('Four-class reference results', 'multiclass_report')]:
+        with st.expander(title): show_table(title, result[key], 'classification_' + key)
+    st.write('Binary confusion matrix: 0 = minor/no injury; 1 = major/fatal.')
+    st.dataframe(result['confusion'], width='stretch')
+    st.subheader('Which variables matter to the selected model?')
+    st.bar_chart(result['importance'].set_index('variable')['macro_F1_drop'])
+    show_table('Variable importance', result['importance'], 'classification_importance')
+    show_table('Variable-set comparisons', result['variable_combinations'], 'classification_variable_sets')
+    show_table('Supported weather/road/vehicle combinations', result['observed_combinations'], 'observed_combinations')
+    st.caption('Combinations use predictions from earlier-year training folds. Importance is post-evaluation and does not establish causation.')
+    with st.expander('Simple reference-tree rules'): st.code(result['rules'], language='text')
+
+def prediction_form(bundle):
+    result = bundle['results'].get('classification')
+    if result is None: return
+    st.subheader('Try one severity prediction')
+    with st.form('severity_form'):
+        a, b = st.columns(2)
+        when = a.date_input('Date', date(2024, 8, 15)); clock = b.time_input('Time', time(20, 0))
+        location = a.text_input('Location', 'P1 San Teodoro')
+        vehicle = b.text_input('Vehicle type', 'Motorcycle')
+        weather = a.selectbox('Weather', sorted(bundle['data']['clean'].weather.dropna().unique()))
+        road = b.selectbox('Road condition', sorted(bundle['data']['clean'].road_condition.dropna().unique()))
+        gender = a.selectbox('Gender as recorded', ['Male', 'Female', 'Male & Female'])
+        submitted = st.form_submit_button('Predict severity')
+    if submitted:
+        record = dict(zip(REQUIRED, [when.strftime('%d/%m/%Y'), clock.strftime('%I:%M %p'), location,
+                                    weather, road, vehicle, '', '', gender]))
+        incoming = prepare_data(pd.DataFrame([record]).to_csv(index=False).encode())['clean']
+        probability = result['model'].predict_proba(features(incoming))[0, 1]
+        st.metric('Model probability: major injury or fatal', f'{probability:.1%}')
+        st.caption('Illustrative prediction among reported records. Review the performance table before use.')
+
+def main():
+    st.set_page_config(page_title='RACC analysis', layout='wide')
+    st.title('RACC data analysis')
+    st.caption('Upload your CSV and run the analysis you need. All results stay in this browser session.')
+    upload = st.sidebar.file_uploader('Upload CSV dataset', type=['csv'], key='dataset_upload')
+    with st.sidebar.expander('CSV and cleaning settings'):
+        fix = st.checkbox('Apply documented provisional date corrections', True, key='date_fixes')
+        encoding = st.selectbox('Encoding', ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1'], key='encoding')
+        separator_name = st.selectbox('Separator', ['Comma', 'Semicolon', 'Tab'], key='separator')
+        separator = {'Comma': ',', 'Semicolon': ';', 'Tab': '\t'}[separator_name]
+    coverage = st.sidebar.checkbox('Assume complete recording calendar', True, key='calendar_coverage')
+    page = st.sidebar.radio('Analysis', ['1. Upload and cleaning', '2. Statistics and EDA',
+        '3. Classification and prediction', '4. Forecasting and downloads',
+        '5. K-Means clustering', '6. Accident hotspot analysis'], key='analysis_page')
+    if upload is None:
+        st.session_state.pop('racc_bundle', None)
+        st.info('Upload RACC.csv using the left panel.')
+        st.code(','.join(REQUIRED), language='text'); return
+    signature = hashlib.sha256(upload.getvalue() + str((fix, encoding, separator, coverage)).encode()).hexdigest()
+    bundle = st.session_state.get('racc_bundle')
+    if bundle is None or bundle['signature'] != signature:
+        st.session_state.pop('racc_bundle', None)
         try:
-            scores,profiles,assigned=run_kmeans(d)
-            st.session_state['kmeans_result']=(scores,profiles,assigned)
-        except Exception as exc: st.error(str(exc))
-    if 'kmeans_result' in st.session_state:
-        scores,profiles,assigned=st.session_state['kmeans_result']
-        st.subheader('Silhouette score by number of clusters')
-        st.dataframe(scores,use_container_width=True,hide_index=True)
-        st.line_chart(scores.set_index('k')['Silhouette score'])
-        st.subheader('Cluster profiles')
-        st.dataframe(profiles,use_container_width=True,hide_index=True)
-        st.download_button('Download cluster assignments',assigned.to_csv(index=False).encode('utf-8'),file_name='RACC_kmeans_assignments.csv',mime='text/csv')
-elif page=='Accident concentration':
-    st.header('Reported accident concentration by normalized location')
-    counts=d.groupby('area').agg(Reported_records=('area','size'),Records_with_valid_severity=('injury_grade',lambda x:int(x.notna().sum())),Severe_labeled_records=('severe',lambda x:int((x==1).sum()))).sort_values('Reported_records',ascending=False).reset_index()
-    st.bar_chart(counts.set_index('area')['Reported_records'])
-    st.dataframe(counts,use_container_width=True,hide_index=True)
-    st.download_button('Download location counts',counts.to_csv(index=False).encode('utf-8'),file_name='RACC_location_counts.csv',mime='text/csv')
-    st.warning('These are counts by location text, not verified road-segment hotspots. The dataset does not contain coordinates, road-segment IDs, traffic exposure, or a denominator for accident rates.')
-elif page=='Data dictionary':
-    st.header('Fields used in this dashboard')
-    dictionary=pd.DataFrame([
-        ['DATE','Parsed as day/month/year; invalid dates remain missing.','Date for chronological evaluation and calendar features.'],
-        ['TIME','Converted to hour when parseable.','Hour-of-day features.'],
-        ['LOCATION','Original text retained; normalized to a recognized barangay when possible.','Location pattern and reported-record counts.'],
-        ['WEATHER','Whitespace trimmed; common categories normalized for analysis.','Input feature.'],
-        ['ROAD CONDITION','Whitespace trimmed and common capitalization variants normalized.','Input feature.'],
-        ['VEHICLE TYPE','Common spelling variants normalized for analysis.','Input feature.'],
-        ['CAUSE','Whitespace/case normalized for analysis.','Input feature; association is not causation.'],
-        ['SEVERITY','Minor Injury/No Injury = non-severe; Major Injury/Fatal = severe.','Prediction target. Conscious/Unconscious and missing labels excluded.'],
-        ['GENDER','Original text retained with lowercase analysis copy.','Optional contextual input feature.']
-    ],columns=['Original field','Cleaning rule','Role'])
-    st.dataframe(dictionary,use_container_width=True,hide_index=True)
-    st.caption('Review all normalization rules with the source agency before treating them as official coding rules.')
+            prepared = prepare_data(upload.getvalue(), fix, encoding, separator)
+        except Exception as exc:
+            st.error('Could not read this dataset: ' + str(exc)); return
+        bundle = {'signature': signature, 'data': prepared, 'results': {}, 'filename': upload.name}
+        st.session_state['racc_bundle'] = bundle
+    d = bundle['data']['clean']; results = bundle['results']
+    a, b, c = st.columns(3)
+    a.metric('Records', len(d)); b.metric('Usable injury grades', int(d.injury_grade.notna().sum()))
+    c.metric('Analyses completed', len(results))
+    st.caption('Repeated rows are retained. Counts describe reported records, not verified unique accidents or accident rates.')
+
+    if page.startswith('1.'):
+        st.header('Upload and data cleaning')
+        show_table('Data quality', bundle['data']['audit'], 'data_quality')
+        st.write('Exact repeats after the first occurrence:', bundle['data']['exact_repeats'])
+        st.write('Unusable dates:', int(d.date.isna().sum()), '| Missing/unusable times:', int(d.hour.isna().sum()))
+        show_table('Dates requiring review', bundle['data']['date_review'], 'date_review')
+        show_table('Cleaned data', d, 'cleaned_data')
+        st.info('Proposed year/date repairs require source-owner confirmation. Conscious and Unconscious are not injury grades. Missing target labels are not imputed.')
+
+    elif page.startswith('2.'):
+        st.header('Statistical analysis and EDA')
+        if st.button('Run statistical analysis', key='run_statistics'):
+            run_analysis(bundle, 'statistics', statistical_analysis, d)
+        if 'statistics' in results:
+            for title, key in [('Category frequencies', 'frequencies'), ('Exploratory association tests', 'associations'),
+                               ('Severity-label coverage by year', 'severity_coverage'), ('Numeric description', 'numeric_summary')]:
+                show_table(title, results['statistics'][key], 'statistics_' + key)
+            st.caption('Association tests collapse provisional incidents, permute labels within year and adjust p-values using Benjamini–Hochberg. Independence and reporting completeness remain assumptions.')
+        category = st.selectbox('Explore a variable', ['weather', 'road_condition', 'vehicle', 'area', 'severity', 'gender_group', 'cause'], key='eda_variable')
+        st.bar_chart(d[category].fillna('missing').value_counts().head(20))
+        st.subheader('Missing values')
+        st.bar_chart(d[['date', 'hour', 'location', 'injury_grade']].isna().mean().mul(100))
+        dated = d.loc[d.date.notna()]
+        if not dated.empty:
+            st.subheader('Monthly reported rows')
+            st.line_chart(dated.groupby(pd.Grouper(key='date', freq='MS')).size())
+            st.subheader('Severity vocabulary by year')
+            st.bar_chart(pd.crosstab(d.year, d.severity.fillna('missing')))
+
+    elif page.startswith('3.'):
+        st.header('Classification and numeric prediction')
+        st.write('Severity classification uses injury-grade recording years with at least 50% valid grades. The latest eligible dates are held out; preprocessing is fitted within training folds.')
+        if st.button('Run classification', key='run_classification'):
+            run_analysis(bundle, 'classification', classification_analysis, d)
+        if 'classification' in results:
+            show_classification(results['classification']); prediction_form(bundle)
+        st.divider(); st.subheader('Predict daily reported-row counts')
+        st.caption('One-day-ahead predictions use observed earlier days. A calendar day absent from the file is assumed to have zero recorded rows. MAE selection can favor a zero-median baseline; compare all error metrics.')
+        if not coverage: st.info('Enable the complete recording-calendar assumption to model counts.')
+        if st.button('Run numeric prediction', disabled=not coverage, key='run_prediction'):
+            try: counts = make_counts(d)
+            except Exception as exc: st.error(str(exc))
+            else: run_analysis(bundle, 'prediction', prediction_analysis, counts)
+        if 'prediction' in results:
+            r = results['prediction']
+            show_table('Numeric prediction performance', r['metrics'], 'prediction_metrics')
+            st.line_chart(r['predictions'].set_index('date')[['actual', 'predicted']])
+            show_table('Next day after the dataset end', r['next_day'], 'next_day')
+            show_table('Daily prediction variables', r['importance'], 'prediction_importance')
+            show_table('Daily variable-set comparisons', r['variable_combinations'], 'prediction_variable_sets')
+            with st.expander('Development comparison and split'):
+                show_table('Development MAE', r['cv'], 'prediction_cv'); st.dataframe(r['split'])
+            st.caption('Importance describes the best learned reference if a constant baseline wins; it does not show that the learned model improves on that baseline.')
+
+    elif page.startswith('4.'):
+        st.header('Forecasting, model performance and downloads')
+        horizon = st.slider('Months beyond the dataset end', 1, 24, 12, key='forecast_horizon')
+        if st.button('Run monthly forecasting', disabled=not coverage, key='run_forecast'):
+            try: counts = make_counts(d)
+            except Exception as exc: st.error(str(exc))
+            else: run_analysis(bundle, 'forecast', forecasting_analysis, counts, horizon)
+        if 'forecast' in results:
+            r = results['forecast']
+            show_table('Monthly forecast performance', r['metrics'], 'forecast_metrics')
+            st.line_chart(r['holdout'].set_index('date')[['actual', 'predicted']])
+            show_table('Forecast after the dataset end', r['future'], 'future_forecast')
+            st.line_chart(r['future'].set_index('date')[['predicted', 'approx_90pct_low', 'approx_90pct_high']])
+            st.caption(f"Approximate 90% intervals use {r['calibration_errors']} development errors. Holdout coverage: {r['interval_coverage']:.1%}. Temporal dependence and small samples limit coverage guarantees.")
+            st.info('Forecast dates follow the last dataset month and may already be in the past. Update the data before current operational use.')
+            with st.expander('Forecast development comparison'): show_table('Development MAE', r['cv'], 'forecast_cv')
+        performance = [r['metrics'].assign(task=task) for task, r in results.items() if 'metrics' in r]
+        if performance: show_table('All completed model evaluations', pd.concat(performance, ignore_index=True), 'all_model_metrics')
+        st.download_button('Download all completed results (ZIP)', download_package(bundle['data'], results, upload.name),
+            file_name='RACC_results.zip', mime='application/zip', key='download_results')
+        st.caption('The ZIP includes cleaned data and the analyses you have actually run. Run statistics, classification, numeric prediction and forecasting to include every task.')
+
+    elif page.startswith('5.'):
+        st.header('K-Means accident pattern clustering')
+        st.caption('Exploratory groupings of reported incident proxies. Silhouette compares k values; clusters do not predict accident occurrence.')
+        if st.button('Run K-Means', key='run_clustering'):
+            run_analysis(bundle, 'clustering', clustering_analysis, d)
+        if 'clustering' in results:
+            r=results['clustering']
+            st.write('Selected:',r['selected_name'])
+            show_table('Silhouette evaluation',r['silhouette'],'clustering_silhouette')
+            st.bar_chart(r['silhouette'].set_index('k')['silhouette_score'])
+            show_table('Cluster profiles',r['profiles'],'clustering_profiles')
+            show_table('Cluster assignments',r['assignments'],'clustering_assignments')
+            st.warning('Clusters summarize records only. They are not verified accident risk, causal factors, or future hotspot predictions.')
+    elif page.startswith('6.'):
+        st.header('Bunawan accident concentration by barangay')
+        if st.button('Analyze barangay counts',key='run_hotspots'):
+            run_analysis(bundle,'hotspots',hotspot_analysis,d)
+        if 'hotspots' in results:
+            r=results['hotspots']
+            show_table('Barangay reported-incident proxy counts',r['barangay_counts'],'hotspot_barangays')
+            st.bar_chart(r['barangay_counts'].set_index('area')['reported_incident_proxies'])
+            show_table('Data limitations',r['data_limitations'],'hotspot_limitations')
+            st.warning('Barangay counts are not road-segment hotspots. Road-name/segment extraction, verified coordinates, and traffic exposure are needed for AH26 versus municipal/barangay-road comparisons.')
+
+if __name__ == '__main__':
+    main()
