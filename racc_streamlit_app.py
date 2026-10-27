@@ -94,3 +94,129 @@ def main():
         encoding = st.selectbox('Encoding', ['utf-8-sig', 'utf-8', 'cp1252', 'latin-1'], key='encoding')
         separator_name = st.selectbox('Separator', ['Comma', 'Semicolon', 'Tab'], key='separator')
         separator = {'Comma': ',', 'Semicolon': ';', 'Tab': '\t'}[separator_name]
+    coverage = st.sidebar.checkbox('Assume complete recording calendar', True, key='calendar_coverage')
+    page = st.sidebar.radio('Analysis', ['1. Upload and cleaning', '2. Statistics and EDA',
+        '3. Classification and prediction', '4. Forecasting and downloads',
+        '5. K-Means clustering', '6. Accident hotspot analysis'], key='analysis_page')
+    if upload is None:
+        st.session_state.pop('racc_bundle', None)
+        st.info('Upload RACC.csv using the left panel.')
+        st.code(','.join(REQUIRED), language='text'); return
+    signature = hashlib.sha256(upload.getvalue() + str((fix, encoding, separator, coverage)).encode()).hexdigest()
+    bundle = st.session_state.get('racc_bundle')
+    if bundle is None or bundle['signature'] != signature:
+        st.session_state.pop('racc_bundle', None)
+        try:
+            prepared = prepare_data(upload.getvalue(), fix, encoding, separator)
+        except Exception as exc:
+            st.error('Could not read this dataset: ' + str(exc)); return
+        bundle = {'signature': signature, 'data': prepared, 'results': {}, 'filename': upload.name}
+        st.session_state['racc_bundle'] = bundle
+    d = bundle['data']['clean']; results = bundle['results']
+    a, b, c = st.columns(3)
+    a.metric('Records', len(d)); b.metric('Usable injury grades', int(d.injury_grade.notna().sum()))
+    c.metric('Analyses completed', len(results))
+    st.caption('Repeated rows are retained. Counts describe reported records, not verified unique accidents or accident rates.')
+
+    if page.startswith('1.'):
+        st.header('Upload and data cleaning')
+        show_table('Data quality', bundle['data']['audit'], 'data_quality')
+        st.write('Exact repeats after the first occurrence:', bundle['data']['exact_repeats'])
+        st.write('Unusable dates:', int(d.date.isna().sum()), '| Missing/unusable times:', int(d.hour.isna().sum()))
+        show_table('Dates requiring review', bundle['data']['date_review'], 'date_review')
+        show_table('Cleaned data', d, 'cleaned_data')
+        st.info('Proposed year/date repairs require source-owner confirmation. Conscious and Unconscious are not injury grades. Missing target labels are not imputed.')
+
+    elif page.startswith('2.'):
+        st.header('Statistical analysis and EDA')
+        if st.button('Run statistical analysis', key='run_statistics'):
+            run_analysis(bundle, 'statistics', statistical_analysis, d)
+        if 'statistics' in results:
+            for title, key in [('Category frequencies', 'frequencies'), ('Exploratory association tests', 'associations'),
+                               ('Severity-label coverage by year', 'severity_coverage'), ('Numeric description', 'numeric_summary')]:
+                show_table(title, results['statistics'][key], 'statistics_' + key)
+            st.caption('Association tests collapse provisional incidents, permute labels within year and adjust p-values using Benjamini–Hochberg. Independence and reporting completeness remain assumptions.')
+        category = st.selectbox('Explore a variable', ['weather', 'road_condition', 'vehicle', 'area', 'severity', 'gender_group', 'cause'], key='eda_variable')
+        st.bar_chart(d[category].fillna('missing').value_counts().head(20))
+        st.subheader('Missing values')
+        st.bar_chart(d[['date', 'hour', 'location', 'injury_grade']].isna().mean().mul(100))
+        dated = d.loc[d.date.notna()]
+        if not dated.empty:
+            st.subheader('Monthly reported rows')
+            st.line_chart(dated.groupby(pd.Grouper(key='date', freq='MS')).size())
+            st.subheader('Severity vocabulary by year')
+            st.bar_chart(pd.crosstab(d.year, d.severity.fillna('missing')))
+
+    elif page.startswith('3.'):
+        st.header('Classification and numeric prediction')
+        st.write('Severity classification uses injury-grade recording years with at least 50% valid grades. The latest eligible dates are held out; preprocessing is fitted within training folds.')
+        if st.button('Run classification', key='run_classification'):
+            run_analysis(bundle, 'classification', classification_analysis, d)
+        if 'classification' in results:
+            show_classification(results['classification']); prediction_form(bundle)
+        st.divider(); st.subheader('Predict daily reported-row counts')
+        st.caption('One-day-ahead predictions use observed earlier days. A calendar day absent from the file is assumed to have zero recorded rows. MAE selection can favor a zero-median baseline; compare all error metrics.')
+        if not coverage: st.info('Enable the complete recording-calendar assumption to model counts.')
+        if st.button('Run numeric prediction', disabled=not coverage, key='run_prediction'):
+            try: counts = make_counts(d)
+            except Exception as exc: st.error(str(exc))
+            else: run_analysis(bundle, 'prediction', prediction_analysis, counts)
+        if 'prediction' in results:
+            r = results['prediction']
+            show_table('Numeric prediction performance', r['metrics'], 'prediction_metrics')
+            st.line_chart(r['predictions'].set_index('date')[['actual', 'predicted']])
+            show_table('Next day after the dataset end', r['next_day'], 'next_day')
+            show_table('Daily prediction variables', r['importance'], 'prediction_importance')
+            show_table('Daily variable-set comparisons', r['variable_combinations'], 'prediction_variable_sets')
+            with st.expander('Development comparison and split'):
+                show_table('Development MAE', r['cv'], 'prediction_cv'); st.dataframe(r['split'])
+            st.caption('Importance describes the best learned reference if a constant baseline wins; it does not show that the learned model improves on that baseline.')
+
+    elif page.startswith('4.'):
+        st.header('Forecasting, model performance and downloads')
+        horizon = st.slider('Months beyond the dataset end', 1, 24, 12, key='forecast_horizon')
+        if st.button('Run monthly forecasting', disabled=not coverage, key='run_forecast'):
+            try: counts = make_counts(d)
+            except Exception as exc: st.error(str(exc))
+            else: run_analysis(bundle, 'forecast', forecasting_analysis, counts, horizon)
+        if 'forecast' in results:
+            r = results['forecast']
+            show_table('Monthly forecast performance', r['metrics'], 'forecast_metrics')
+            st.line_chart(r['holdout'].set_index('date')[['actual', 'predicted']])
+            show_table('Forecast after the dataset end', r['future'], 'future_forecast')
+            st.line_chart(r['future'].set_index('date')[['predicted', 'approx_90pct_low', 'approx_90pct_high']])
+            st.caption(f"Approximate 90% intervals use {r['calibration_errors']} development errors. Holdout coverage: {r['interval_coverage']:.1%}. Temporal dependence and small samples limit coverage guarantees.")
+            st.info('Forecast dates follow the last dataset month and may already be in the past. Update the data before current operational use.')
+            with st.expander('Forecast development comparison'): show_table('Development MAE', r['cv'], 'forecast_cv')
+        performance = [r['metrics'].assign(task=task) for task, r in results.items() if 'metrics' in r]
+        if performance: show_table('All completed model evaluations', pd.concat(performance, ignore_index=True), 'all_model_metrics')
+        st.download_button('Download all completed results (ZIP)', download_package(bundle['data'], results, upload.name),
+            file_name='RACC_results.zip', mime='application/zip', key='download_results')
+        st.caption('The ZIP includes cleaned data and the analyses you have actually run. Run statistics, classification, numeric prediction and forecasting to include every task.')
+
+    elif page.startswith('5.'):
+        st.header('K-Means accident pattern clustering')
+        st.caption('Exploratory groupings of reported incident proxies. Silhouette compares k values; clusters do not predict accident occurrence.')
+        if st.button('Run K-Means', key='run_clustering'):
+            run_analysis(bundle, 'clustering', clustering_analysis, d)
+        if 'clustering' in results:
+            r=results['clustering']
+            st.write('Selected:',r['selected_name'])
+            show_table('Silhouette evaluation',r['silhouette'],'clustering_silhouette')
+            st.bar_chart(r['silhouette'].set_index('k')['silhouette_score'])
+            show_table('Cluster profiles',r['profiles'],'clustering_profiles')
+            show_table('Cluster assignments',r['assignments'],'clustering_assignments')
+            st.warning('Clusters summarize records only. They are not verified accident risk, causal factors, or future hotspot predictions.')
+    elif page.startswith('6.'):
+        st.header('Bunawan accident concentration by barangay')
+        if st.button('Analyze barangay counts',key='run_hotspots'):
+            run_analysis(bundle,'hotspots',hotspot_analysis,d)
+        if 'hotspots' in results:
+            r=results['hotspots']
+            show_table('Barangay reported-incident proxy counts',r['barangay_counts'],'hotspot_barangays')
+            st.bar_chart(r['barangay_counts'].set_index('area')['reported_incident_proxies'])
+            show_table('Data limitations',r['data_limitations'],'hotspot_limitations')
+            st.warning('Barangay counts are not road-segment hotspots. Road-name/segment extraction, verified coordinates, and traffic exposure are needed for AH26 versus municipal/barangay-road comparisons.')
+
+if __name__ == '__main__':
+    main()
